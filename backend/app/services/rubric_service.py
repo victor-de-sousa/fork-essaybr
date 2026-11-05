@@ -84,7 +84,9 @@ class RubricService:
 
     def ingest(self, pdf_bytes, filename):
         if not isinstance(pdf_bytes, bytes) or not pdf_bytes or len(pdf_bytes) > 30 * 1024 * 1024:
-            raise ValueError("PDF vazio ou maior que 30 MB.")
+            raise ValueError("Fonte normativa vazia ou maior que 30 MB.")
+        if Path(str(filename).replace("\\", "/")).suffix.lower() == ".json" or pdf_bytes.lstrip().startswith((b"{", b"[")):
+            return self.ingest_json(pdf_bytes, filename)
         if b"%PDF-" not in pdf_bytes[:1024]:
             raise ValueError("Envie um PDF real. Exportações JSON e nomes de arquivo não comprovam a fonte oficial.")
         try:
@@ -100,6 +102,7 @@ class RubricService:
             raise ValueError("PDF excede o limite de extração textual de 2 milhões de caracteres.")
         sha = hashlib.sha256(pdf_bytes).hexdigest()
         state = {"status": "pending_review", "document_sha256": sha,
+                 "source_format": "pdf",
                  "filename": Path(str(filename).replace("\\", "/")).name[:200], "page_count": len(pages),
                  "pages": pages, "proposal": None, "extraction_error": None, "version": None,
                  "uploaded_at": datetime.now(timezone.utc).isoformat()}
@@ -119,6 +122,62 @@ class RubricService:
                 state["extraction_error"] = str(exc)
         with self._state_lock:
             atomic_write(self.directory / "sources" / f"{sha}.pdf", pdf_bytes)
+            write_json(self.directory / "current.json", state)
+        return self.status()
+
+    @staticmethod
+    def _json_pages(document):
+        pages = document.get("pages") if isinstance(document, dict) else None
+        if not isinstance(pages, list) or not pages:
+            raise ValueError("JSON normativo inválido: a fonte deve conter uma lista de páginas (não é um PDF ou JSON normativo válido).")
+
+        def texts(node):
+            if isinstance(node, dict):
+                value = node.get("text")
+                if isinstance(value, str) and value.strip():
+                    yield value.strip()
+                for child in node.get("children", []):
+                    yield from texts(child)
+            elif isinstance(node, list):
+                for child in node:
+                    yield from texts(child)
+
+        result = [{"page": index + 1, "text": "\n".join(texts(page))}
+                  for index, page in enumerate(pages)]
+        if not any(page["text"] for page in result):
+            raise ValueError("JSON normativo não contém texto extraível.")
+        full_text = "\n".join(page["text"] for page in result)
+        if not re.search(r"\b2026\b", full_text):
+            raise ValueError("A fonte JSON não identifica a Cartilha ENEM 2026.")
+        return result
+
+    def ingest_json(self, json_bytes, filename):
+        if not isinstance(json_bytes, bytes) or len(json_bytes) > 30 * 1024 * 1024:
+            raise ValueError("JSON normativo vazio ou maior que 30 MB.")
+        try:
+            document = json.loads(json_bytes)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("JSON normativo inválido.") from exc
+        pages = self._json_pages(document)
+        sha = hashlib.sha256(json_bytes).hexdigest()
+        state = {"status": "pending_review", "document_sha256": sha,
+                 "source_format": "json",
+                 "filename": Path(str(filename).replace("\\", "/")).name[:200], "page_count": len(pages),
+                 "pages": pages, "proposal": None, "extraction_error": None, "version": None,
+                 "uploaded_at": datetime.now(timezone.utc).isoformat()}
+        try:
+            proposal = self.llm.generate({
+                "task": "extract_normative_rubric",
+                "instruction": "Extraia exclusivamente a matriz oficial ENEM 2026, os seis descritores de cada uma das cinco competências, TODAS as regras de anulação, exceções e casos especiais, e exemplos identificados como exemplos. Não invente conteúdo ausente. As citações devem ser literais e identificar a página 1-based do JSON. A proposta será revisada por pessoa antes do uso.",
+                "document_sha256": sha, "source_json_pages": pages,
+            }, Rubric.model_json_schema(), seed=1)
+            state["proposal"] = proposal
+            rubric = Rubric.model_validate(proposal)
+            self.validate_rubric(rubric, pages)
+        except (RuntimeError, ValueError) as exc:
+            state["extraction_error"] = str(exc)
+        with self._state_lock:
+            atomic_write(self.directory / "sources" / f"{sha}.json", json_bytes)
             write_json(self.directory / "current.json", state)
         return self.status()
 
@@ -150,12 +209,14 @@ class RubricService:
         with self._state_lock:
             state = self._state()
             if not state or approval.document_sha256 != state["document_sha256"]:
-                raise ValueError("O hash não corresponde ao PDF atualmente em revisão.")
+                raise ValueError("O hash não corresponde à fonte normativa atualmente em revisão.")
             self.validate_rubric(approval.rubric, state["pages"])
-            source = self.directory / "sources" / f"{approval.document_sha256}.pdf"
+            source_format = state.get("source_format", "pdf")
+            source = self.directory / "sources" / f"{approval.document_sha256}.{source_format}"
             if hashlib.sha256(source.read_bytes()).hexdigest() != approval.document_sha256:
-                raise ValueError("O PDF foi alterado após a extração; envie novamente.")
+                raise ValueError("A fonte normativa foi alterada após a extração; envie novamente.")
             snapshot = {"document_sha256": approval.document_sha256, "year": 2026,
+                        "source_format": source_format,
                         "rubric": approval.rubric.model_dump(), "pages": state["pages"],
                         "reviewer": approval.reviewer, "official_source_confirmed": True,
                         "special_rules_reviewed": True, "approved_at": datetime.now(timezone.utc).isoformat()}
@@ -178,9 +239,10 @@ class RubricService:
         content = {key: value for key, value in snapshot.items() if key != "version"}
         if snapshot.get("version") != version or digest_json(content) != version:
             raise ValueError("A versão normativa foi alterada; aprovação inválida.")
-        source = self.directory / "sources" / f"{snapshot['document_sha256']}.pdf"
+        source_format = snapshot.get("source_format", "pdf")
+        source = self.directory / "sources" / f"{snapshot['document_sha256']}.{source_format}"
         if not source.exists() or hashlib.sha256(source.read_bytes()).hexdigest() != snapshot["document_sha256"]:
-            raise ValueError("O PDF da versão aprovada está ausente ou foi alterado.")
+            raise ValueError("O arquivo da fonte normativa aprovada está ausente ou foi alterado.")
         rubric = Rubric.model_validate(snapshot["rubric"])
         self.validate_rubric(rubric, snapshot["pages"])
         return snapshot

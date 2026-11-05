@@ -128,6 +128,17 @@ def test_rejects_json_export_as_pdf(tmp_path):
         service.ingest(b'{"pages": []}', "cartilha_enem_2026.json")
 
 
+def test_ingests_structured_2026_json_by_page(tmp_path, monkeypatch):
+    service = RubricService(settings_at(tmp_path))
+    monkeypatch.setattr(service.llm, "generate", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline")))
+    payload = b'{"schemaVersion": 5, "pages": [{"children": [{"text": "ENEM 2026"}, {"children": [{"text": "Competencia 1"}]}]}]}'
+    result = service.ingest(payload, "cartilha_enem_2026.json")
+    assert result["status"] == "pending_review"
+    assert result["source_format"] == "json"
+    assert result["page_count"] == 1
+    assert "Competencia 1" in result["pages"][0]["text"]
+
+
 def test_tampered_source_revokes_approval(ingested):
     _, service, result = ingested
     service.approve(reviewed_payload(result))
