@@ -1,3 +1,4 @@
+import ast
 import logging
 import os
 from typing import Tuple
@@ -35,15 +36,15 @@ class Corpus:
         :return: training, development, and testing
         """
         path = 'essay-br/splits'
-        training = pd.read_csv(os.path.join(path, 'training.csv'), converters={'essay': eval, 'competence': eval})
-        development = pd.read_csv(os.path.join(path, 'development.csv'), converters={'essay': eval, 'competence': eval})
-        testing = pd.read_csv(os.path.join(path, 'testing.csv'), converters={'essay': eval, 'competence': eval})
+        training = pd.read_csv(os.path.join(path, 'training.csv'), converters={'essay': ast.literal_eval, 'competence': ast.literal_eval})
+        development = pd.read_csv(os.path.join(path, 'development.csv'), converters={'essay': ast.literal_eval, 'competence': ast.literal_eval})
+        testing = pd.read_csv(os.path.join(path, 'testing.csv'), converters={'essay': ast.literal_eval, 'competence': ast.literal_eval})
         return training, development, testing
 
     @staticmethod
     def read_corpus() -> DataFrame:
         path = 'essay-br/'
-        return pd.read_csv(os.path.join(path, 'essay-br.csv'), converters={'essay': eval, 'competence': eval})
+        return pd.read_csv(os.path.join(path, 'essay-br.csv'), converters={'essay': ast.literal_eval, 'competence': ast.literal_eval})
 
     @staticmethod
     def save_split(name: str, df_input: DataFrame) -> None:
