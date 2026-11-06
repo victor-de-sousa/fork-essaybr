@@ -25,7 +25,8 @@ def set_seed(seed):
 
 def train_transformer(data_dir,base_model,output,objective='ordinal',epochs=8,batch_size=2,
                       learning_rate=2e-5,weight_decay=.01,patience=2,seed=42,max_length=512,
-                      overlap=64,device='auto',resume=False,chunk_batch_size=8):
+                      overlap=64,device='auto',resume=False,chunk_batch_size=8,
+                      max_train=None,max_development=None):
     if epochs<1 or batch_size<1 or patience<1 or learning_rate<=0:
         raise ValueError('epochs, batch_size, patience and learning_rate must be positive')
     data_dir,base_model,output=Path(data_dir),Path(base_model),Path(output)
@@ -36,6 +37,12 @@ def train_transformer(data_dir,base_model,output,objective='ordinal',epochs=8,ba
     verify_prepared(data_dir)
     training=load_records(data_dir/'training.jsonl');development=load_records(data_dir/'development.jsonl')
     if not training or not development: raise ValueError('Empty training or development split')
+    if max_train is not None:
+        if max_train < 1: raise ValueError('max_train must be positive')
+        training=training[:max_train]
+    if max_development is not None:
+        if max_development < 1: raise ValueError('max_development must be positive')
+        development=development[:max_development]
     provenance={split:file_hash(data_dir/f'{split}.jsonl') for split in ('training','development')}
     tokenizer=AutoTokenizer.from_pretrained(base_model,local_files_only=True)
     encoder=AutoModel.from_pretrained(base_model,local_files_only=True)
@@ -50,9 +57,11 @@ def train_transformer(data_dir,base_model,output,objective='ordinal',epochs=8,ba
         'overlap':overlap,'chunk_batch_size':chunk_batch_size}
     fingerprint=hashlib.sha256(json.dumps({'data':provenance,'hp':hp,'base_config':encoder.config.to_dict()},sort_keys=True).encode()).hexdigest()[:12]
     version=f'bertimbau-{objective}-{fingerprint}'
-    metadata={'schema_version':1,'version':version,'trained':True,'kind':f'transformer_{objective}',
+    limited=max_train is not None or max_development is not None
+    metadata={'schema_version':1,'version':version,'trained':not limited,'engineering_smoke':limited,
         'created_at':datetime.now(timezone.utc).isoformat(),'base_model':str(base_model.resolve()),
         'hyperparameters':hp,'data_sha256':provenance,'seed':seed,'max_length':max_length,'overlap':overlap,
+        'training_scope':'limited smoke subset' if limited else 'prepared training split',
         'selection_split':'development','selection_metric':'macro_qwk_then_macro_mae','test_evaluated':False,
         'train_count':len(training),'development_count':len(development),'device':str(device),
         'torch_version':torch.__version__}
@@ -117,6 +126,8 @@ def main():
     p.add_argument('--max-length',type=int,default=512);p.add_argument('--overlap',type=int,default=64)
     p.add_argument('--device',default='auto');p.add_argument('--resume',action='store_true')
     p.add_argument('--chunk-batch-size',type=int,default=8)
+    p.add_argument('--max-train',type=int,default=None)
+    p.add_argument('--max-development',type=int,default=None)
     args=vars(p.parse_args());args['data_dir']=args.pop('data')
     print(json.dumps(train_transformer(**args),indent=2))
 
