@@ -85,6 +85,81 @@ Esse acordo moderado e o corpus relativamente pequeno limitam o uso pedagógico.
 
 [Predictor](../backend/app/ml/predict.py) recebe o diretório do artefato. `predict(text)` retorna `scores` com `c1` a `c5` e `model_info` contendo versão, tipo e estado treinado. `status()` informa ausência/incompletude; `ModelUnavailableError` impede substituir ausência por notas fixas. A camada normativa e as justificativas usam a cartilha revisada, separadamente do preditor supervisionado.
 
+## Treinamento otimizado e backups
+
+O treinamento Transformer em [train.py](../backend/app/ml/train.py) possui dois
+modos:
+
+- `--training-mode full`: atualiza encoder e cabeça de pontuação.
+- `--training-mode frozen`: congela o encoder em avaliação, desativa gradientes
+  do encoder e treina somente a cabeça.
+
+Os tokens são armazenados em cache content-addressed em
+`<output>/token-cache`. A chave inclui tokenizer, textos/IDs, `max-length` e
+`overlap`; alterações nesses elementos geram outro cache. O padding continua
+dinâmico por batch e os tokens não são truncados silenciosamente.
+
+Backups transacionais são controlados por [checkpoints.py](../backend/app/ml/checkpoints.py):
+
+```bash
+PYTHONPATH=backend .venv/bin/python -m app.ml.train \
+  --data datasets/prepared \
+  --base-model artifacts/models/bertimbau \
+  --output artifacts/models/bertimbau-ordinal \
+  --objective ordinal --training-mode frozen \
+  --backup-interval-seconds 1800 --max-backups 2 \
+  --backup-root artifacts/models/training-backups \
+  --device cpu
+```
+
+Cada execução recebe um `run_id` e grava em
+`artifacts/models/training-backups/<run_id>/`. O checkpoint só é renomeado
+atomicamente após manifesto SHA-256 e validação dos arquivos. Falhas não
+removem backups válidos. O contador não reutiliza números, inclusive após uma
+gravação falha. Por padrão apenas os dois backups válidos mais recentes são
+mantidos.
+
+Para retomar um checkpoint de época:
+
+```bash
+PYTHONPATH=backend .venv/bin/python -m app.ml.train ... \
+  --resume-latest --backup-root artifacts/models/training-backups \
+  --run-id <run_id>
+```
+
+Também é possível usar `--resume-from <backup>/model`. A compatibilidade de
+versão, arquitetura, dados e hiperparâmetros é verificada antes de carregar.
+O estado do otimizador, scheduler, época, histórico e RNG é salvo. A retomada
+também preserva a permutação da época, o próximo índice de batch e o `global_step`.
+Assim, um backup criado após um `optimizer.step()` retoma no batch seguinte,
+sem repetir a atualização confirmada. O backup é sempre um limite seguro; se o
+processo cair durante o batch atual, esse batch ainda pode ser refeito, mas
+nenhuma atualização parcialmente gravada é considerada.
+
+Benchmark em textos reais do conjunto completo (32 redações, 229 segmentos,
+janela 64, encoder frozen, duas passagens do batch representativo):
+
+| Threads | Forward médio por batch | RSS máximo observado |
+|---:|---:|---:|
+| 4 | 2,370 s | 892,9 MB |
+| 6 | 1,792 s | 894,6 MB |
+| 8 | 1,544 s | 897,9 MB |
+| 12 | 3,078 s | 899,2 MB |
+
+O treino persistente foi iniciado com 8 threads, modo `frozen`, janela 256 e
+sobreposição 32. O serviço systemd de usuário é `enem-bertimbau-frozen.service`;
+seu log é `artifacts/models/training-logs/overnight.log` e os backups ficam em
+`artifacts/models/training-backups/overnight-frozen/`. Consulte o estado com:
+
+```bash
+systemctl --user status enem-bertimbau-frozen.service
+tail -f artifacts/models/training-logs/overnight.log
+```
+
+Pare com `systemctl --user stop enem-bertimbau-frozen.service`. Para retomar,
+execute o mesmo comando com `--resume-latest --run-id overnight-frozen`; a
+execução validará o manifesto e escolherá o backup mais recente íntegro.
+
 ```bash
 PYTHONPATH=backend .venv/bin/python -m pytest \
   backend/tests/test_dataset.py backend/tests/test_metrics.py backend/tests/test_ml.py -q

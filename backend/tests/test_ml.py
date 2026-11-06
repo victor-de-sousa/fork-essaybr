@@ -91,3 +91,20 @@ def test_comparison_refuses_mixed_training_provenance(tmp_path):
             'data_sha256':{'training':sha,'development':'ccc'}}))
     with pytest.raises(ValueError,match='provenance'):
         compare([tmp_path/'first',tmp_path/'second'],tmp_path/'selection.json')
+
+
+def test_backup_manager_is_atomic_sequential_and_retains_two(tmp_path):
+    from app.ml.checkpoints import BackupManager, CheckpointError
+    manager = BackupManager(tmp_path/'backups', 'run-1', max_backups=2)
+    for value in range(1, 5):
+        manager.save(lambda directory, value=value: (directory/'state.txt').write_text(str(value)))
+    assert [path.name for path in manager.valid_backups()] == ['backup-train-03', 'backup-train-04']
+    assert (manager.latest()/'state.txt').read_text() == '4'
+    assert not (manager.directory/'backup-train-01').exists()
+    with pytest.raises(RuntimeError):
+        manager.save(lambda directory: (_ for _ in ()).throw(RuntimeError('write failed')))
+    assert [path.name for path in manager.valid_backups()] == ['backup-train-03', 'backup-train-04']
+    (manager.latest()/'state.txt').write_text('tampered')
+    assert [path.name for path in manager.valid_backups()] == ['backup-train-03']
+    manager.save(lambda directory: (directory/'state.txt').write_text('5'))
+    assert [path.name for path in manager.valid_backups()] == ['backup-train-03', 'backup-train-06']

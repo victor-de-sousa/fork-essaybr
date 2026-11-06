@@ -13,6 +13,10 @@
   local.
 - A inferência do baseline foi executada localmente com o artefato versionado,
   e a avaliação do teste reservado foi reexecutada sem alterar o modelo.
+- O pipeline Transformer agora possui cache persistente de tokens, modo
+  `frozen` e backups transacionais com manifesto SHA-256, contador monotônico,
+  retenção configurável (padrão: dois) e retomada exata no próximo batch após
+  cada passo confirmado.
 - A cartilha pode ser ingerida a partir do PDF original ou do JSON estruturado
   existente em `cartilha_enem_2026.json`. O JSON é convertido em páginas de
   texto mantendo a ordem dos nós e é identificado por SHA-256.
@@ -33,6 +37,8 @@
   fonte em `pending_review`, sem produzir nota.
 - As métricas disponíveis são do baseline e não comprovam equivalência à
   correção oficial do INEP.
+- O treino `full` no conjunto completo continua limitado pelo tempo de CPU:
+  uma época excedeu 30 minutos na execução anterior.
 
 ## Modelos e métricas
 
@@ -65,6 +71,8 @@
 5. Obter explicitamente um checkpoint local BERTimbau compatível e executar um
    treino limitado com tempo/memória configuráveis; comparar somente após
    registrar a seleção no conjunto de desenvolvimento.
+6. Acompanhar a execução persistente e avaliar o checkpoint final somente após
+   o encerramento normal.
 
 ## Validação executada em 2026-11-05
 
@@ -80,6 +88,23 @@
   checkpoint em `artifacts/models/bertimbau-ordinal-smoke`. A inferência direta
   funcionou e produziu `[80, 80, 80, 80, 80]`; o Predictor rejeita o artefato
   por `trained: false`.
+- Treino `frozen` de engenharia: executado com 4 exemplos de treino e 4 de
+  desenvolvimento; produziu métricas reais e backup validado em
+  `/tmp/frozen-backups/frozen-test/backup-train-01`.
+- Teste da infraestrutura de backups: **70 testes backend aprovados**, incluindo
+  sequência, falha de gravação, corrupção e retenção.
+- Teste de interrupção/retomada: uma execução BERT pequena foi interrompida
+  após o primeiro backup no meio da época; a retomada e a execução contínua
+  equivalente produziram pesos idênticos (`same_weights=True`). Os backups
+  finais da execução de teste foram `backup-train-03` e `backup-train-04`.
+- Benchmark representativo em 32 textos reais: 8 threads foram melhores
+  (1,544 s por forward batch, contra 3,078 s com 12 threads).
+- Treinamento persistente completo iniciado em
+  `enem-bertimbau-frozen.service`, modo frozen, 3.194 exemplos de treino,
+  686 de desenvolvimento, 8 épocas, backup a cada 1.800 segundos. Estado
+  inicial confirmado como `active (running)`, PID 108796; ainda não concluído.
+- Logs: `artifacts/models/training-logs/overnight.log`.
+- Backups: `artifacts/models/training-backups/overnight-frozen/`.
 - Métricas do smoke validation (8 exemplos): MAE médio 47,0, RMSE médio
   54,6680 e QWK médio 0,0. Esses números não representam qualidade do modelo
   e não foram usados para seleção.

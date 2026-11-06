@@ -6,6 +6,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from .dataset import write_json
+import hashlib
 
 
 def chunk_token_ids(ids, content_length=510, overlap=64):
@@ -36,6 +37,53 @@ def encode_essays(tokenizer,texts,max_length=512,overlap=64):
     return batch['input_ids'],batch['attention_mask'],torch.tensor(owners,dtype=torch.long)
 
 
+def token_cache_key(tokenizer, records, max_length, overlap):
+    payload = {
+        "tokenizer": tokenizer.name_or_path,
+        "tokenizer_config": getattr(tokenizer, "init_kwargs", {}),
+        "records": [(r["id"], r["text"]) for r in records],
+        "max_length": max_length,
+        "overlap": overlap,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
+
+
+def encode_cached(tokenizer, records, max_length, overlap, cache_dir):
+    """Return token chunks from a content-addressed, atomic cache."""
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path = cache_dir / f"{token_cache_key(tokenizer, records, max_length, overlap)}.json"
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    encoded = []
+    for owner, record in enumerate(records):
+        ids = tokenizer.encode(record["text"], add_special_tokens=False, truncation=False)
+        for chunk in chunk_token_ids(ids, max_length - tokenizer.num_special_tokens_to_add(pair=False), overlap):
+            encoded.append({"owner": owner, "ids": chunk})
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(encoded), encoding="utf-8")
+    temporary.replace(path)
+    return encoded
+
+
+def batch_from_cached(tokenizer, chunks, start, end):
+    prepared = [
+        tokenizer.prepare_for_model(item["ids"], add_special_tokens=True,
+                                    truncation=False, padding=False,
+                                    return_attention_mask=True)
+        for item in chunks[start:end]
+    ]
+    batch = tokenizer.pad(prepared, padding=True, return_tensors="pt")
+    owners = torch.tensor([item["owner"] for item in chunks[start:end]], dtype=torch.long)
+    return batch["input_ids"], batch["attention_mask"], owners
+
+
+def select_cached(chunks, owners):
+    mapping = {old: new for new, old in enumerate(owners)}
+    return [{"owner": mapping[item["owner"]], "ids": item["ids"]}
+            for item in chunks if item["owner"] in mapping]
+
+
 def ordinal_targets(scores):
     return (scores.unsqueeze(-1)/40 > torch.arange(5,device=scores.device)).float()
 
@@ -50,13 +98,17 @@ def decode_predictions(logits,objective):
 
 
 class EssayScorer(nn.Module):
-    def __init__(self,encoder,objective='ordinal',chunk_batch_size=8):
+    def __init__(self,encoder,objective='ordinal',chunk_batch_size=8,frozen=False):
         super().__init__()
         if objective not in ('ordinal','regression'):
             raise ValueError('objective must be ordinal or regression')
         self.encoder=encoder
         self.objective=objective
         self.chunk_batch_size=chunk_batch_size
+        self.frozen=frozen
+        if frozen:
+            for parameter in self.encoder.parameters():
+                parameter.requires_grad_(False)
         self.head=nn.Linear(encoder.config.hidden_size,5)
         if objective=='ordinal':
             self.first_threshold=nn.Parameter(torch.full((5,1),-2.))
@@ -65,8 +117,13 @@ class EssayScorer(nn.Module):
     def forward(self,input_ids,attention_mask,owners,essay_count):
         pooled=[]
         for start in range(0,len(input_ids),self.chunk_batch_size):
-            result=self.encoder(input_ids=input_ids[start:start+self.chunk_batch_size],
-                                attention_mask=attention_mask[start:start+self.chunk_batch_size])
+            if self.frozen:
+                with torch.no_grad():
+                    result=self.encoder(input_ids=input_ids[start:start+self.chunk_batch_size],
+                                        attention_mask=attention_mask[start:start+self.chunk_batch_size])
+            else:
+                result=self.encoder(input_ids=input_ids[start:start+self.chunk_batch_size],
+                                    attention_mask=attention_mask[start:start+self.chunk_batch_size])
             pooled.append(result.last_hidden_state[:,0])
         embeddings=torch.cat(pooled)
         # Length-weighted pooling includes the final partial chunk instead of discarding it.
@@ -94,7 +151,7 @@ def save_checkpoint(model,path: Path,metadata: dict,tokenizer=None):
     if tokenizer is not None:
         tokenizer.save_pretrained(path/'tokenizer')
     write_json(path/'metadata.json',metadata | {'objective':model.objective,'kind':f'transformer_{model.objective}',
-        'chunk_batch_size':model.chunk_batch_size})
+        'chunk_batch_size':model.chunk_batch_size,'training_mode':'frozen' if model.frozen else 'full'})
 
 
 def load_checkpoint(path: Path,device='cpu'):
@@ -103,7 +160,8 @@ def load_checkpoint(path: Path,device='cpu'):
     path=Path(path)
     metadata=json.loads((path/'metadata.json').read_text(encoding='utf-8'))
     config=AutoConfig.from_pretrained(path/'encoder',local_files_only=True)
-    model=EssayScorer(AutoModel.from_config(config),metadata['objective'],metadata.get('chunk_batch_size',8))
+    model=EssayScorer(AutoModel.from_config(config),metadata['objective'],
+                      metadata.get('chunk_batch_size',8), metadata.get('training_mode') == 'frozen')
     model.load_state_dict(load_file(str(path/'model.safetensors'),device='cpu'))
     model.to(device);model.eval()
     return model,metadata
