@@ -41,6 +41,10 @@ def token_cache_key(tokenizer, records, max_length, overlap):
     payload = {
         "tokenizer": tokenizer.name_or_path,
         "tokenizer_config": getattr(tokenizer, "init_kwargs", {}),
+        "tokenizer_content": (tokenizer.backend_tokenizer.to_str()
+                              if getattr(tokenizer, 'backend_tokenizer', None) is not None
+                              else tokenizer.get_vocab()),
+        "special_tokens": tokenizer.special_tokens_map,
         "records": [(r["id"], r["text"]) for r in records],
         "max_length": max_length,
         "overlap": overlap,
@@ -105,16 +109,26 @@ class EssayScorer(nn.Module):
         self.encoder=encoder
         self.objective=objective
         self.chunk_batch_size=chunk_batch_size
+        if chunk_batch_size < 1:
+            raise ValueError('chunk_batch_size must be positive')
         self.frozen=frozen
         if frozen:
             for parameter in self.encoder.parameters():
                 parameter.requires_grad_(False)
+            self.encoder.eval()
         self.head=nn.Linear(encoder.config.hidden_size,5)
         if objective=='ordinal':
             self.first_threshold=nn.Parameter(torch.full((5,1),-2.))
             self.threshold_increments=nn.Parameter(torch.ones(5,4))
 
-    def forward(self,input_ids,attention_mask,owners,essay_count):
+    def train(self, mode=True):
+        super().train(mode)
+        if self.frozen:
+            self.encoder.eval()
+        return self
+
+    def encode_features(self,input_ids,attention_mask,owners,essay_count):
+        """Same CLS/length pooling for online training, cached training and inference."""
         pooled=[]
         for start in range(0,len(input_ids),self.chunk_batch_size):
             if self.frozen:
@@ -130,7 +144,12 @@ class EssayScorer(nn.Module):
         weights=attention_mask.sum(1).to(embeddings.dtype)
         sums=embeddings.new_zeros((essay_count,embeddings.shape[-1])).index_add(0,owners,embeddings*weights[:,None])
         totals=embeddings.new_zeros(essay_count).index_add(0,owners,weights)
-        features=sums/totals[:,None].clamp_min(1)
+        return sums/totals[:,None].clamp_min(1)
+
+    def forward(self,input_ids,attention_mask,owners,essay_count):
+        return self.forward_features(self.encode_features(input_ids,attention_mask,owners,essay_count))
+
+    def forward_features(self, features):
         values=self.head(features)
         if self.objective=='regression':
             return values

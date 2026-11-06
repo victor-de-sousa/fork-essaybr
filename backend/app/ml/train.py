@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 import random
+import shutil
 import time
 import numpy as np
 import torch
@@ -14,7 +15,7 @@ from .dataset import file_hash,load_records,write_json,verify_prepared
 from .baseline import selection_key
 from .metrics import score_metrics
 from .transformer import (EssayScorer, encode_cached, batch_from_cached, select_cached,
-                          load_checkpoint, predict_texts, save_checkpoint)
+                          load_checkpoint, predict_texts, save_checkpoint, decode_predictions)
 from .checkpoints import BackupManager, CheckpointError
 
 
@@ -30,12 +31,26 @@ def train_transformer(data_dir,base_model,output,objective='ordinal',epochs=8,ba
                       overlap=64,device='auto',resume=False,chunk_batch_size=8,
                       max_train=None,max_development=None,training_mode='full',
                       backup_interval_seconds=1800,max_backups=2,backup_root=None,
-                      run_id=None,resume_latest=False,resume_from=None):
+                      run_id=None,resume_latest=False,resume_from=None,embedding_cache=None,
+                      cpu_threads=None):
     if epochs<1 or batch_size<1 or patience<1 or learning_rate<=0:
         raise ValueError('epochs, batch_size, patience and learning_rate must be positive')
     if training_mode not in ('full','frozen'):
         raise ValueError('training_mode must be full or frozen')
+    if embedding_cache is not None and training_mode != 'frozen':
+        raise ValueError('embedding_cache requires training_mode frozen')
+    if cpu_threads is not None:
+        if cpu_threads < 1: raise ValueError('cpu_threads must be positive')
+        torch.set_num_threads(cpu_threads)
     data_dir,base_model,output=Path(data_dir),Path(base_model),Path(output)
+    resuming = resume or resume_latest or resume_from is not None
+    occupied = output.exists() and any(output.iterdir())
+    if not resuming and occupied:
+        raise FileExistsError(f'Experiment output is not empty; choose a new output: {output}')
+    if occupied and resume_from is not None and Path(resume_from).resolve() != (output/'checkpoint-last').resolve():
+        raise FileExistsError('External resume requires a new empty output; existing experiment is preserved')
+    if resume and not resume_from and not resume_latest and run_id is None and (output/'metadata.json').exists():
+        run_id=json.loads((output/'metadata.json').read_text()).get('run_id')
     if not base_model.is_dir():
         raise FileNotFoundError('BERTimbau local ausente. Execute o download explícito antes do treino.')
     set_seed(seed)
@@ -71,7 +86,8 @@ def train_transformer(data_dir,base_model,output,objective='ordinal',epochs=8,ba
         'training_scope':'limited smoke subset' if limited else 'prepared training split',
         'selection_split':'development','selection_metric':'macro_qwk_then_macro_mae','test_evaluated':False,
         'train_count':len(training),'development_count':len(development),'device':str(device),
-        'torch_version':torch.__version__}
+        'torch_version':str(torch.__version__), 'cpu_threads':torch.get_num_threads(),
+        'embedding_cache':str(embedding_cache) if embedding_cache is not None else None}
     optimizer=torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
                                 lr=learning_rate,weight_decay=weight_decay)
     total_steps=((len(training)+batch_size-1)//batch_size)*epochs
@@ -92,41 +108,97 @@ def train_transformer(data_dir,base_model,output,objective='ordinal',epochs=8,ba
                     continue
         if candidates:
             run_id=max(candidates)[1]
-    run_id = run_id or f'run-{datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")}-{version}'
+    run_id = run_id or f'run-{datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")}-{version}'
+    if not resuming and (backup_root/run_id).exists():
+        raise FileExistsError('Backup run_id already exists; choose a new experiment ID')
     backups = BackupManager(backup_root,run_id,max_backups)
+    metadata['run_id']=run_id
     cache_dir=output/'token-cache'
-    cached_training=encode_cached(tokenizer,training,max_length,overlap,cache_dir)
     last=output/'checkpoint-last'
     resume_path = Path(resume_from) if resume_from else (backups.latest()/'model' if resume_latest else last)
-    if resume or resume_latest or resume_from:
+    resume_loss_sum=0.;resume_steps=0
+    def copy_best(source, destination):
+        destination.mkdir(parents=True,exist_ok=True)
+        for name in ('model.safetensors','metadata.json'):
+            shutil.copy2(source/name,destination/name)
+        for name in ('encoder','tokenizer'):
+            shutil.copytree(source/name,destination/name,dirs_exist_ok=True)
+        if destination.resolve()==output.resolve():
+            copied=json.loads((destination/'metadata.json').read_text())
+            copied['source_run_id']=copied.get('run_id')
+            copied['run_id']=run_id
+            write_json(destination/'metadata.json',copied)
+    if resuming:
         if not resume_path.exists():
             raise ValueError(f'Resume checkpoint not found: {resume_path}')
         resumed,saved=load_checkpoint(resume_path,device)
         if saved['version']!=version:
             raise ValueError('Resume data/model/hyperparameters differ from the saved checkpoint')
+        if occupied and resume_latest:
+            existing=json.loads((output/'metadata.json').read_text()) if (output/'metadata.json').exists() else {}
+            if not existing.get('run_id') or existing['run_id']!=saved.get('run_id'):
+                raise FileExistsError('Latest backup does not own this output; recover into a new empty directory')
         model.load_state_dict(resumed.state_dict())
-        state_path = resume_path.parent/'trainer_state.pt' if resume_path.name == 'model' else last/'trainer.pt'
+        state_path = resume_path.parent/'trainer_state.pt' if resume_path.name == 'model' else resume_path/'trainer.pt'
         state=torch.load(state_path,map_location='cpu',weights_only=True)
         optimizer.load_state_dict(state['optimizer']);scheduler.load_state_dict(state['scheduler'])
-        start_epoch=state['epoch'];next_batch=state.get('next_batch',0)
-        resume_indices=state.get('indices')
-        global_step=state.get('global_step',0);best=state['best'];stale=state['stale'];history=state['history']
+        # Legacy checkpoint-last stored the completed epoch (zero-based), while
+        # periodic backups already stored the next cursor. Accept both safely.
+        start_epoch=state['epoch'] + (1 if 'next_batch' not in state else 0)
+        next_batch=state.get('next_batch',0)
+        resume_indices=state.get('indices') or None
+        global_step=state.get('global_step',state['scheduler'].get('last_epoch',0))
+        best=state['best'];stale=state['stale'];history=state['history']
+        resume_loss_sum=state.get('loss_sum',0.);resume_steps=state.get('steps',0)
+        if best is not None:
+            archived_best=resume_path.parent/'best' if resume_path.name=='model' else resume_path.parent
+            if archived_best.resolve()!=output.resolve() and (archived_best/'metadata.json').exists():
+                best_meta=json.loads((archived_best/'metadata.json').read_text())
+                if best_meta['version']!=version or best_meta['validation_metrics']!=best:
+                    raise ValueError('Backup best checkpoint does not match trainer state')
+                copy_best(archived_best,output)
+            else:
+                best_path=output/'metadata.json'
+                best_meta=json.loads(best_path.read_text()) if best_path.exists() else {}
+                if (not (output/'model.safetensors').exists() or best_meta.get('version')!=version
+                        or best_meta.get('validation_metrics')!=best):
+                    raise ValueError('Resume requires the matching best checkpoint; legacy backup contains only latest weights')
         random.setstate(state['python_rng']);torch.set_rng_state(state['torch_rng'])
         if device.startswith('cuda') and state.get('cuda_rng'): torch.cuda.set_rng_state_all(state['cuda_rng'])
+    preprocessing_started=time.monotonic()
+    training_features=development_features=None
+    cached_training=None
+    if start_epoch>=epochs or stale>=patience:
+        pass  # Completed recovery needs no encoder pass.
+    elif embedding_cache is not None:
+        from .features import cached_features
+        training_features=cached_features(model,tokenizer,training,max_length,overlap,embedding_cache,batch_size)
+        development_features=cached_features(model,tokenizer,development,max_length,overlap,embedding_cache,batch_size)
+    else:
+        cached_training=encode_cached(tokenizer,training,max_length,overlap,cache_dir)
+    preprocessing_seconds=time.monotonic()-preprocessing_started
+    metadata['preprocessing_seconds']=preprocessing_seconds
     next_backup=time.monotonic()+backup_interval_seconds
     started=time.monotonic()
     def save_backup(epoch, next_batch, indices):
-        state_payload={'epoch':epoch,'next_batch':next_batch,'global_step':global_step,
+        state_payload={'schema_version':2,'epoch':epoch,'next_batch':next_batch,'global_step':global_step,
                        'indices':indices,'best':best,'stale':stale,'history':history,
+                       'loss_sum':loss_sum if indices is not None else 0.,
+                       'steps':steps if indices is not None else 0,
                        'python_rng':random.getstate(),'torch_rng':torch.get_rng_state(),
+                       'cuda_rng':torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
                        'optimizer':optimizer.state_dict(),'scheduler':scheduler.state_dict()}
         def write_backup(directory):
             save_checkpoint(model,directory/'model',metadata|{'epoch':epoch,'run_id':run_id},tokenizer)
             torch.save(optimizer.state_dict(),directory/'optimizer.pt')
             torch.save(scheduler.state_dict(),directory/'scheduler.pt')
             torch.save(state_payload,directory/'trainer_state.pt')
+            if best is not None:
+                copy_best(output,directory/'best')
         return backups.save(write_backup)
     for epoch in range(start_epoch,epochs):
+        if stale>=patience: break
+        epoch_started=time.monotonic()
         model.train()
         if training_mode == 'frozen':
             model.encoder.eval()
@@ -134,16 +206,20 @@ def train_transformer(data_dir,base_model,output,objective='ordinal',epochs=8,ba
         if resume_indices is None:
             random.shuffle(indices)
         resume_indices=None
-        loss_sum=0.;steps=0
+        loss_sum=resume_loss_sum;steps=resume_steps
+        resume_loss_sum=0.;resume_steps=0
         batch_start=next_batch if epoch == start_epoch else 0
         for start in range(batch_start,len(indices),batch_size):
             batch_indices=indices[start:start+batch_size]
             batch=[training[i] for i in batch_indices]
-            cached_batch=select_cached(cached_training,batch_indices)
-            ids,mask,owners=batch_from_cached(tokenizer,cached_batch,0,len(cached_batch))
             targets=torch.tensor([r['scores'] for r in batch],device=device)
             optimizer.zero_grad(set_to_none=True)
-            logits=model(ids.to(device),mask.to(device),owners.to(device),len(batch))
+            if training_features is not None:
+                logits=model.forward_features(training_features[batch_indices].to(device))
+            else:
+                cached_batch=select_cached(cached_training,batch_indices)
+                ids,mask,owners=batch_from_cached(tokenizer,cached_batch,0,len(cached_batch))
+                logits=model(ids.to(device),mask.to(device),owners.to(device),len(batch))
             loss=model.loss(logits,targets)
             if not torch.isfinite(loss): raise RuntimeError('Non-finite training loss')
             loss.backward();torch.nn.utils.clip_grad_norm_(model.parameters(),1.)
@@ -154,9 +230,18 @@ def train_transformer(data_dir,base_model,output,objective='ordinal',epochs=8,ba
                 backup=save_backup(epoch,next_batch,indices)
                 print(json.dumps({'backup':str(backup),'retained':[str(p) for p in backups.valid_backups()]},default=str),flush=True)
                 next_backup=time.monotonic()+backup_interval_seconds
-        predictions=predict_texts(model,tokenizer,[r['text'] for r in development],max_length,overlap,batch_size)
+        training_seconds=time.monotonic()-epoch_started
+        validation_started=time.monotonic()
+        if development_features is None:
+            predictions=predict_texts(model,tokenizer,[r['text'] for r in development],max_length,overlap,batch_size)
+        else:
+            model.eval()
+            with torch.no_grad():
+                predictions=torch.cat([decode_predictions(model.forward_features(features.to(device)),objective).cpu()
+                                       for features in development_features.split(batch_size)]).numpy()
         metrics=score_metrics([r['scores'] for r in development],predictions)
-        entry={'epoch':epoch+1,'train_loss':loss_sum/steps,'validation_metrics':metrics,
+        entry={'epoch':epoch+1,'train_loss':loss_sum/steps if steps else None,'validation_metrics':metrics,
+               'training_seconds':training_seconds,'validation_seconds':time.monotonic()-validation_started,
                'elapsed_seconds':time.monotonic()-started,'learning_rate':scheduler.get_last_lr()[0]}
         history.append(entry)
         if best is None or selection_key(metrics)<selection_key(best):
@@ -164,18 +249,27 @@ def train_transformer(data_dir,base_model,output,objective='ordinal',epochs=8,ba
             save_checkpoint(model,output,metadata|{'best_epoch':epoch+1,'validation_metrics':metrics},tokenizer)
         else: stale+=1
         save_checkpoint(model,last,metadata|{'epoch':epoch+1},tokenizer)
-        torch.save({'optimizer':optimizer.state_dict(),'scheduler':scheduler.state_dict(),'epoch':epoch,
+        torch.save({'schema_version':2,'optimizer':optimizer.state_dict(),'scheduler':scheduler.state_dict(),'epoch':epoch+1,
+                    'next_batch':0,'indices':None,'global_step':global_step,'loss_sum':0.,'steps':0,
                     'best':best,'stale':stale,'history':history,'python_rng':random.getstate(),
                     'torch_rng':torch.get_rng_state(),'cuda_rng':torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []},last/'trainer.pt')
         write_json(output/'training_log.json',{'version':version,'hyperparameters':hp,'epochs':history,
-            'early_stopped':stale>=patience,'selection_split':'development','test_evaluated':False})
+            'early_stopped':stale>=patience,'selection_split':'development','test_evaluated':False,
+            'preprocessing_seconds':preprocessing_seconds,'embedding_cache':metadata['embedding_cache']})
         print(json.dumps({'epoch':epoch+1,'loss':entry['train_loss'],'development':metrics['macro']},allow_nan=False),flush=True)
         if time.monotonic() >= next_backup:
-            backup=save_backup(epoch+1,0,[])
+            backup=save_backup(epoch+1,0,None)
             print(json.dumps({'backup':str(backup),'retained':[str(p) for p in backups.valid_backups()]},default=str),flush=True)
             next_backup=time.monotonic()+backup_interval_seconds
         next_batch=0
         if stale>=patience: break
+    if resuming and not (last/'trainer.pt').exists():
+        save_checkpoint(model,last,metadata|{'epoch':start_epoch},tokenizer)
+        torch.save(state|{'schema_version':2,'epoch':start_epoch,'next_batch':next_batch,
+                         'indices':resume_indices,'global_step':global_step},last/'trainer.pt')
+    write_json(output/'training_log.json',{'version':version,'hyperparameters':hp,'epochs':history,
+        'early_stopped':stale>=patience,'selection_split':'development','test_evaluated':False,
+        'preprocessing_seconds':preprocessing_seconds,'embedding_cache':metadata['embedding_cache']})
     return {'version':version,'validation_metrics':best,'epochs_completed':len(history),'test_evaluated':False,
             'backup_run_id':run_id,'backups':[str(p) for p in backups.valid_backups()]}
 
@@ -201,6 +295,9 @@ def main():
     p.add_argument('--run-id',default=None)
     p.add_argument('--resume-latest',action='store_true')
     p.add_argument('--resume-from',type=Path,default=None)
+    p.add_argument('--embedding-cache',type=Path,default=None,
+                   help='Persistent FP32 encoder features (frozen only); shared across new experiments')
+    p.add_argument('--cpu-threads',type=int,default=None)
     args=vars(p.parse_args());args['data_dir']=args.pop('data')
     print(json.dumps(train_transformer(**args),indent=2))
 
